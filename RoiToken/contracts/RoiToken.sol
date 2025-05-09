@@ -24,7 +24,6 @@ interface IUniswapV2Router {
     ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
 }
 
-
 interface IUniswapV2Factory {
     function createPair(address tokenA, address tokenB) external returns (address);
 }
@@ -45,6 +44,9 @@ contract RoiToken is ERC20, Ownable {
 
     bool public swapEnabled = true;
     bool private swapping;
+    
+    // Added trading control variables
+    bool public tradingEnabled = false;
 
     uint256 public swapTokensAtAmount = 100_000 * 1e18;
 
@@ -52,6 +54,10 @@ contract RoiToken is ERC20, Ownable {
     mapping(address => bool) public isExcludedFromLimits;
 
     address public constant DEAD_ADDRESS = address(0xdead);
+
+    // Events for better tracking and transparency
+    event TradingStatusChanged(bool enabled);
+    event SwapThresholdUpdated(uint256 newThreshold);
 
     constructor(address _router) ERC20("RoiToken", "ROI") Ownable(msg.sender) {
         _mint(msg.sender, 1_000_000_000 * 1e18); // 1 billion ROI
@@ -77,50 +83,65 @@ contract RoiToken is ERC20, Ownable {
         isExcludedFromLimits[_pair] = true;
     }
 
-    function _transfer(address from, address to, uint256 amount) internal override {
-        require(from != address(0) && to != address(0), "Invalid address");
+    function _update(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override {
+        // Check if trading is enabled or if owner is involved in the transfer
+        if (!tradingEnabled) {
+            require(from == owner() || to == owner(), "Trading not yet enabled");
+        }
 
-        if (!isExcludedFromLimits[from] && !isExcludedFromLimits[to]) {
-            require(amount <= maxTxAmount, "Exceeds max tx amount");
+        // Check for zero addresses - handled by parent implementation
+        if (from != address(0) && to != address(0)) {
+            // Transaction limits
+            if (!isExcludedFromLimits[from] && !isExcludedFromLimits[to]) {
+                require(amount <= maxTxAmount, "Exceeds max tx amount");
 
-            if (to != uniswapPair) {
-                require(balanceOf(to) + amount <= maxWalletAmount, "Exceeds max wallet");
+                if (to != uniswapPair) {
+                    require(balanceOf(to) + amount <= maxWalletAmount, "Exceeds max wallet");
+                }
+            }
+
+            // Swap and liquify
+            uint256 contractTokenBalance = balanceOf(address(this));
+            bool canSwap = contractTokenBalance >= swapTokensAtAmount;
+
+            if (
+                canSwap &&
+                !swapping &&
+                to == uniswapPair &&
+                swapEnabled &&
+                !isExcludedFromFees[from] &&
+                !isExcludedFromFees[to]
+            ) {
+                swapping = true;
+                swapAndLiquify(swapTokensAtAmount);
+                swapping = false;
+            }
+
+            // Fee handling
+            if (!swapping && !isExcludedFromFees[from] && !isExcludedFromFees[to]) {
+                uint256 fees = 0;
+                
+                if (to == uniswapPair && sellTax > 0) {
+                    fees = (amount * sellTax) / 100;
+                } else if (from == uniswapPair && buyTax > 0) {
+                    fees = (amount * buyTax) / 100;
+                }
+
+                if (fees > 0) {
+                    // Transfer fees to contract
+                    super._update(from, address(this), fees);
+                    // Adjust amount being transferred
+                    amount -= fees;
+                }
             }
         }
 
-        uint256 contractTokenBalance = balanceOf(address(this));
-
-        bool canSwap = contractTokenBalance >= swapTokensAtAmount;
-
-        if (
-            canSwap &&
-            !swapping &&
-            to == uniswapPair &&
-            swapEnabled &&
-            !isExcludedFromFees[from] &&
-            !isExcludedFromFees[to]
-        ) {
-            swapping = true;
-            swapAndLiquify(swapTokensAtAmount);
-            swapping = false;
-        }
-
-        uint256 fees = 0;
-
-        if (!swapping && !isExcludedFromFees[from] && !isExcludedFromFees[to]) {
-            if (to == uniswapPair && sellTax > 0) {
-                fees = (amount * sellTax) / 100;
-            } else if (from == uniswapPair && buyTax > 0) {
-                fees = (amount * buyTax) / 100;
-            }
-
-            if (fees > 0) {
-                super._transfer(from, address(this), fees);
-                amount -= fees;
-            }
-        }
-
-        super._transfer(from, to, amount);
+        // Call parent implementation for the actual transfer
+        super._update(from, to, amount);
     }
 
     function swapAndLiquify(uint256 tokenAmount) private {
@@ -144,26 +165,24 @@ contract RoiToken is ERC20, Ownable {
         if (liquidityTokens > 0 && ethForLiquidity > 0) {
             addLiquidity(liquidityTokens, ethForLiquidity);
         }
-   }
+    }
    
- function swapTokensForETH(uint256 tokenAmount) private {
-    // Create the path array properly 
-    address[] memory path = new address[](2);
-    path[0] = address(this);
-    path[1] = uniswapRouter.WETH();
+    function swapTokensForETH(uint256 tokenAmount) private {
+        // Create the path array properly 
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapRouter.WETH();
 
-    _approve(address(this), address(uniswapRouter), tokenAmount);
+        _approve(address(this), address(uniswapRouter), tokenAmount);
 
-    uniswapRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
-        tokenAmount,
-        0, // accept any amount of ETH
-        path,
-        address(this),
-        block.timestamp
-    );
-}
-
-
+        uniswapRouter.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0, // accept any amount of ETH
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
 
     function addLiquidity(uint256 tokenAmount, uint256 ethAmount) private {
         _approve(address(this), address(uniswapRouter), tokenAmount);
@@ -176,6 +195,24 @@ contract RoiToken is ERC20, Ownable {
             liquidityReceiver,
             block.timestamp
         );
+    }
+
+    // Trading control functions
+    function enableTrading() external onlyOwner {
+        tradingEnabled = true;
+        emit TradingStatusChanged(true);
+    }
+
+    function disableTrading() external onlyOwner {
+        tradingEnabled = false;
+        emit TradingStatusChanged(false);
+    }
+
+    // Swap threshold setting function
+    function setSwapTokensAtAmount(uint256 newAmount) external onlyOwner {
+        require(newAmount > 0, "Amount must be greater than 0");
+        swapTokensAtAmount = newAmount;
+        emit SwapThresholdUpdated(newAmount);
     }
 
     function setBuyTax(uint256 _buyTax) external onlyOwner {
