@@ -8,7 +8,10 @@ module.exports = {
     settings: {
       optimizer: {
         enabled: true,
-        runs: 200
+        runs: 200,
+        sourcify: {
+        enabled: true
+}
       }
     }
   },
