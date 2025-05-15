@@ -48,6 +48,12 @@ contract TokenLock is Ownable {
     ) external {
         require(amount > 0, "Amount must be > 0");
         require(unlockTime > block.timestamp, "Unlock time must be in future");
+        require(token.code.length > 0, "Invalid token contract address");
+
+    try IERC20(token).totalSupply() returns (uint256) {} 
+    catch {
+        revert("Token does not implement ERC20 interface");
+    }
 
         if (vestingDuration > 0) {
             require(
